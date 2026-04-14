@@ -1,33 +1,33 @@
 """
-Servidor web para reconhecimento/cadastro pelo navegador (PC ou celular).
+Servidor web — mesmo cadastro/reconhecimento do sistema desktop (face_recognition + .pkl).
 
-O GitHub não executa Python: você inicia este servidor no PC e abre o link
-mostrado no terminal (rede local) ou um túnel HTTPS (ex.: ngrok) para a câmera
-ao vivo no celular funcionar em mais navegadores.
+Uso no PC e celular (mesma Wi-Fi):
+  python -m uvicorn web_app:app --host 0.0.0.0 --port 8000
 
-Uso:
-  uvicorn web_app:app --host 0.0.0.0 --port 8000
-
-Depois abra no PC: http://127.0.0.1:8000
-No celular (mesma Wi-Fi): http://<IP_DO_PC>:8000
+Importante: use --host 0.0.0.0 (não só 127.0.0.1), senão o celular não conecta.
 """
 
 from __future__ import annotations
 
+import io
 import socket
 import sys
+import threading
 from contextlib import asynccontextmanager
 from typing import Any
 
 import cv2
 import face_recognition
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
+from PIL import Image, ImageOps
 
 from sistema_final_perfeito import FaceRecognitionSystem
 
 _sistema: FaceRecognitionSystem | None = None
+_sistema_lock = threading.Lock()
+_MAX_SIDE = 1600
 
 
 def _lan_ip() -> str:
@@ -42,8 +42,28 @@ def _lan_ip() -> str:
 
 
 def _decode_image(data: bytes) -> np.ndarray | None:
-    arr = np.frombuffer(data, dtype=np.uint8)
-    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    """BGR OpenCV; corrige rotação EXIF (fotos de celular)."""
+    if not data:
+        return None
+    try:
+        pil = Image.open(io.BytesIO(data))
+        pil = ImageOps.exif_transpose(pil)
+        if pil.mode != "RGB":
+            pil = pil.convert("RGB")
+        rgb = np.array(pil)
+        frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
+    h, w = frame.shape[:2]
+    m = max(h, w)
+    if m > _MAX_SIDE:
+        s = _MAX_SIDE / m
+        frame = cv2.resize(
+            frame, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA
+        )
     return frame
 
 
@@ -87,6 +107,11 @@ def _largest_face(faces: np.ndarray) -> tuple[int, int, int, int] | None:
     return best
 
 
+def _form_bool_amostra(raw: str) -> bool:
+    """Evita bool('false') == True em multipart/form-data."""
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _sistema
@@ -100,10 +125,9 @@ async def lifespan(app: FastAPI):
     print("\n" + "=" * 60)
     print("  Facial Python — modo web")
     print("=" * 60)
-    print(f"  PC:    http://127.0.0.1:8000")
-    print(f"  Rede:  http://{ip}:8000  (celular na mesma Wi-Fi)")
-    print("  Câmera ao vivo no celular costuma exigir HTTPS; use ngrok")
-    print("  ou tire foto pelo botão «Tirar foto», que funciona em HTTP.")
+    print(f"  PC:     http://127.0.0.1:8000")
+    print(f"  Celular (mesma Wi-Fi): http://{ip}:8000")
+    print("  O servidor PRECISA usar --host 0.0.0.0 para o celular entrar.")
     print("=" * 60 + "\n")
     yield
     if _sistema is not None:
@@ -117,14 +141,28 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Facial Python Web", lifespan=lifespan)
 
 
+@app.get("/api/server")
+def api_server(request: Request) -> dict[str, Any]:
+    """URLs para abrir no PC e no celular."""
+    ip = _lan_ip()
+    port = request.url.port or 8000
+    return {
+        "lan_ip": ip,
+        "url_pc": f"http://127.0.0.1:{port}",
+        "url_celular": f"http://{ip}:{port}",
+        "voce_esta_em": str(request.base_url).rstrip("/"),
+    }
+
+
 @app.get("/api/status")
 def api_status() -> dict[str, Any]:
     if _sistema is None:
         raise HTTPException(503, "Sistema não inicializado")
-    return {
-        "pessoas": len(_sistema.known_face_names),
-        "nomes": list(_sistema.known_face_names),
-    }
+    with _sistema_lock:
+        return {
+            "pessoas": len(_sistema.known_face_names),
+            "nomes": list(_sistema.known_face_names),
+        }
 
 
 @app.post("/api/recognize")
@@ -134,112 +172,148 @@ async def api_recognize(image: UploadFile = File(...)) -> JSONResponse:
     raw = await image.read()
     frame = _decode_image(raw)
     if frame is None:
-        raise HTTPException(400, "Imagem inválida")
-    faces = _find_faces(_sistema, frame)
-    rect = _largest_face(faces)
-    if rect is None:
+        raise HTTPException(400, "Imagem inválida ou vazia")
+    with _sistema_lock:
+        faces = _find_faces(_sistema, frame)
+        rect = _largest_face(faces)
+        if rect is None:
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "face_found": False,
+                    "name": None,
+                    "confidence": 0.0,
+                    "message": "Nenhuma face detectada. Tente outro ângulo ou mais luz.",
+                }
+            )
+        name, conf = _sistema.recognize_face_simple(frame, rect)
+        if name:
+            _sistema.log_recognition(name, float(conf))
         return JSONResponse(
-            {"ok": True, "face_found": False, "name": None, "confidence": 0.0}
+            {
+                "ok": True,
+                "face_found": True,
+                "name": name,
+                "confidence": round(float(conf), 4),
+                "message": (
+                    f"Reconhecido: {name}"
+                    if name
+                    else "Face vista, mas não bate com ninguém cadastrado."
+                ),
+                "box": {"x": rect[0], "y": rect[1], "w": rect[2], "h": rect[3]},
+            }
         )
-    name, conf = _sistema.recognize_face_simple(frame, rect)
-    if name:
-        _sistema.log_recognition(name, float(conf))
-    return JSONResponse(
-        {
-            "ok": True,
-            "face_found": True,
-            "name": name,
-            "confidence": round(float(conf), 4),
-            "box": {"x": rect[0], "y": rect[1], "w": rect[2], "h": rect[3]},
-        }
-    )
 
 
 @app.post("/api/register")
 async def api_register(
     image: UploadFile = File(...),
     nome: str = Form(...),
-    amostra: bool = Form(False),
+    amostra: str = Form("false"),
 ) -> JSONResponse:
     if _sistema is None:
         raise HTTPException(503, "Sistema não inicializado")
     raw = await image.read()
     frame = _decode_image(raw)
     if frame is None:
-        raise HTTPException(400, "Imagem inválida")
-    faces = _find_faces(_sistema, frame)
-    rect = _largest_face(faces)
-    if rect is None:
-        raise HTTPException(400, "Nenhuma face detectada na imagem")
-    ok, msg = _sistema.cadastrar_web(frame, rect, nome, adicionar_amostra=amostra)
+        raise HTTPException(400, "Imagem inválida ou vazia")
+    adicionar_amostra = _form_bool_amostra(amostra)
+    nome = (nome or "").strip()
+    with _sistema_lock:
+        faces = _find_faces(_sistema, frame)
+        rect = _largest_face(faces)
+        if rect is None:
+            raise HTTPException(
+                400,
+                "Nenhuma face detectada. Centralize o rosto, boa luz, e tente de novo.",
+            )
+        ok, msg = _sistema.cadastrar_web(
+            frame, rect, nome, adicionar_amostra=adicionar_amostra
+        )
     if not ok:
         raise HTTPException(400, msg)
     return JSONResponse({"ok": True, "message": msg})
 
 
-INDEX_HTML = """<!DOCTYPE html>
+INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Facial Python — Web</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>Facial Python</title>
   <style>
-    :root { --bg:#0d1117; --card:#161b22; --text:#e6edf3; --accent:#58a6ff; --ok:#3fb950; --err:#f85149; }
+    :root { --bg:#0d1117; --card:#161b22; --text:#e6edf3; --accent:#238636; --blue:#1f6feb; --err:#f85149; }
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text);
-      margin: 0; padding: 16px; max-width: 520px; margin-left: auto; margin-right: auto; }
-    h1 { font-size: 1.25rem; margin: 0 0 8px; }
-    p.hint { font-size: 0.85rem; opacity: 0.85; margin: 0 0 16px; line-height: 1.45; }
-    .card { background: var(--card); border-radius: 12px; padding: 16px; margin-bottom: 16px;
-      border: 1px solid #30363d; }
-    video, canvas { width: 100%; border-radius: 8px; background: #000; display: block; }
-    video { max-height: 280px; object-fit: cover; }
-    .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-    button, label.btn { cursor: pointer; border: 0; border-radius: 8px; padding: 10px 14px;
-      font-size: 0.95rem; background: var(--accent); color: #fff; }
-    label.btn { display: inline-block; background: #238636; }
-    button.secondary { background: #30363d; color: var(--text); }
-    input[type="text"] { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #30363d;
-      background: #0d1117; color: var(--text); margin-top: 8px; }
-    #out { margin-top: 12px; padding: 12px; border-radius: 8px; background: #21262d; font-size: 0.95rem; white-space: pre-wrap; }
-    #out.err { border: 1px solid var(--err); }
-    #out.ok { border: 1px solid var(--ok); }
+      margin: 0; padding: 12px; max-width: 560px; margin-left: auto; margin-right: auto; }
+    h1 { font-size: 1.35rem; margin: 0 0 4px; }
+    .links { background: #21262d; border: 1px solid #30363d; border-radius: 10px; padding: 12px; margin: 12px 0; font-size: 0.9rem; }
+    .links a { color: #58a6ff; word-break: break-all; }
+    .warn { color: #d29922; font-size: 0.85rem; margin: 8px 0; line-height: 1.4; }
+    .card { background: var(--card); border-radius: 12px; padding: 14px; margin-bottom: 12px; border: 1px solid #30363d; }
+    .card strong { display: block; margin-bottom: 8px; font-size: 1rem; }
+    video, canvas { width: 100%; border-radius: 10px; background: #000; display: block; min-height: 120px; }
+    video { max-height: 320px; object-fit: cover; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .btn-big { flex: 1 1 100%; padding: 16px; font-size: 1.05rem; border: 0; border-radius: 10px;
+      cursor: pointer; font-weight: 600; color: #fff; }
+    .btn-rec { background: var(--blue); }
+    .btn-cad { background: var(--accent); }
+    .btn-sec { background: #30363d; color: var(--text); padding: 12px 14px; border: 0; border-radius: 8px; cursor: pointer; }
+    label.filelab { display: block; text-align: center; padding: 14px; background: #30363d; border-radius: 10px;
+      cursor: pointer; font-weight: 600; }
+    label.filelab input { display: none; }
+    input[type="text"] { width: 100%; padding: 14px; border-radius: 10px; border: 1px solid #30363d;
+      background: #0d1117; color: var(--text); font-size: 1rem; margin-top: 6px; }
+    #out { margin-top: 12px; padding: 14px; border-radius: 10px; background: #21262d; font-size: 0.95rem;
+      white-space: pre-wrap; line-height: 1.45; border: 1px solid #30363d; }
+    #out.err { border-color: var(--err); }
+    #out.ok { border-color: #238636; }
     .hidden { display: none !important; }
-    #statusLine { font-size: 0.8rem; opacity: 0.7; margin-bottom: 16px; }
+    #statusLine { font-size: 0.82rem; opacity: 0.85; margin-bottom: 8px; }
   </style>
 </head>
 <body>
   <h1>Facial Python</h1>
-  <p class="hint">Servidor rodando no seu PC. No celular, use a mesma rede Wi-Fi e o endereço
-    que apareceu no terminal. «Tirar foto» funciona sem HTTPS; vídeo ao vivo pode exigir HTTPS (ex.: ngrok).</p>
-  <p id="statusLine"></p>
+  <p id="statusLine">Carregando…</p>
+  <div class="links" id="linkBox">
+    <div><strong>Abrir no celular</strong> (mesma Wi-Fi que o PC):</div>
+    <div id="urlCel"></div>
+    <div style="margin-top:8px"><strong>No PC:</strong> <a id="urlPc" href="#">127.0.0.1</a></div>
+  </div>
+  <p class="warn">Se o celular não abrir: confirme que o servidor foi iniciado com <code>--host 0.0.0.0</code>,
+    desative “isolamento de cliente” no roteador se existir, e permita o Python no firewall do Windows.</p>
 
   <div class="card">
-    <strong>Pré-visualização</strong>
+    <strong>1 — Foto do rosto</strong>
     <video id="vid" playsinline autoplay muted class="hidden"></video>
     <canvas id="cv" class="hidden"></canvas>
     <div class="row">
-      <button type="button" id="btnCam">Usar câmera ao vivo</button>
-      <button type="button" class="secondary" id="btnStop">Parar câmera</button>
+      <label class="filelab">📷 Tirar / escolher foto<input type="file" accept="image/*" capture="user" id="fileIn"></label>
     </div>
     <div class="row">
-      <label class="btn">Tirar foto<input type="file" accept="image/*" capture="user" id="fileIn" class="hidden"></label>
-    </div>
-  </div>
-
-  <div class="card">
-    <strong>Reconhecer</strong>
-    <div class="row">
-      <button type="button" id="btnRec">Reconhecer (foto atual)</button>
+      <button type="button" class="btn-sec" id="btnCam">Câmera ao vivo (PC ou HTTPS)</button>
+      <button type="button" class="btn-sec" id="btnStop">Parar câmera</button>
     </div>
   </div>
 
   <div class="card">
-    <strong>Cadastrar / amostra extra</strong>
-    <input type="text" id="nome" placeholder="Nome da pessoa" autocomplete="name">
+    <strong>2 — Reconhecer</strong>
+    <span style="font-size:0.85rem;opacity:0.9">Igual à tecla ESPAÇO no programa antigo: usa a foto acima.</span>
     <div class="row">
-      <button type="button" id="btnCad">Cadastrar novo</button>
-      <button type="button" class="secondary" id="btnAmostra">Só amostra extra</button>
+      <button type="button" class="btn-big btn-rec" id="btnRec">RECONHECER</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>3 — Cadastrar novo</strong>
+    <span style="font-size:0.85rem;opacity:0.9">Igual ao fluxo «C» no desktop: nome + face na foto.</span>
+    <input type="text" id="nome" placeholder="Nome da pessoa" autocomplete="name" enterkeyhint="done">
+    <div class="row">
+      <button type="button" class="btn-big btn-cad" id="btnCad">CADASTRAR</button>
+    </div>
+    <div class="row">
+      <button type="button" class="btn-sec" id="btnAmostra">Só amostra extra (já cadastrado)</button>
     </div>
   </div>
 
@@ -252,16 +326,43 @@ const ctx = cv.getContext('2d');
 const out = document.getElementById('out');
 const statusLine = document.getElementById('statusLine');
 
+function errText(j) {
+  if (!j || j.detail === undefined) return 'Erro na resposta';
+  const d = j.detail;
+  if (typeof d === 'string') return d;
+  if (Array.isArray(d)) return d.map(x => x.msg || JSON.stringify(x)).join('\n');
+  return JSON.stringify(d);
+}
+
 async function refreshStatus() {
   try {
     const r = await fetch('/api/status');
+    if (!r.ok) throw new Error();
     const j = await r.json();
     statusLine.textContent = 'Cadastrados: ' + j.pessoas + (j.nomes.length ? ' — ' + j.nomes.join(', ') : '');
   } catch (e) {
-    statusLine.textContent = 'Não foi possível ler /api/status';
+    statusLine.textContent = 'Sem conexão com o servidor. Confira o endereço e se o terminal está rodando uvicorn.';
   }
 }
+
+async function refreshLinks() {
+  try {
+    const r = await fetch('/api/server');
+    const j = await r.json();
+    const a = document.createElement('a');
+    a.href = j.url_celular;
+    a.textContent = j.url_celular;
+    const box = document.getElementById('urlCel');
+    box.innerHTML = '';
+    box.appendChild(a);
+    const pc = document.getElementById('urlPc');
+    pc.href = j.url_pc;
+    pc.textContent = j.url_pc;
+  } catch (e) {}
+}
 refreshStatus();
+refreshLinks();
+setInterval(refreshStatus, 15000);
 
 function setOut(text, ok) {
   out.textContent = text;
@@ -273,14 +374,15 @@ function frameBlob(cb) {
     cv.width = vid.videoWidth;
     cv.height = vid.videoHeight;
     ctx.drawImage(vid, 0, 0);
-    cv.toBlob(cb, 'image/jpeg', 0.85);
+    cv.classList.remove('hidden');
+    cv.toBlob(cb, 'image/jpeg', 0.92);
     return;
   }
   if (cv.width > 0 && cv.height > 0) {
-    cv.toBlob(cb, 'image/jpeg', 0.85);
+    cv.toBlob(cb, 'image/jpeg', 0.92);
     return;
   }
-  setOut('Ative a câmera ou use «Tirar foto».', false);
+  setOut('Primeiro use «Tirar / escolher foto» ou a câmera ao vivo.', false);
 }
 
 document.getElementById('btnCam').onclick = async () => {
@@ -289,9 +391,9 @@ document.getElementById('btnCam').onclick = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
     vid.srcObject = stream;
     vid.classList.remove('hidden');
-    setOut('Câmera ativa. Use «Reconhecer» ou cadastro.', true);
+    setOut('Câmera ativa. Toque em RECONHECER ou CADASTRAR.', true);
   } catch (e) {
-    setOut('Câmera bloqueada ou indisponível. Em HTTP no celular use «Tirar foto».', false);
+    setOut('Câmera ao vivo indisponível neste modo. Use «Tirar / escolher foto» (funciona no celular em HTTP).', false);
   }
 };
 
@@ -314,8 +416,9 @@ document.getElementById('fileIn').onchange = async (ev) => {
     URL.revokeObjectURL(url);
     cv.classList.remove('hidden');
     vid.classList.add('hidden');
-    setOut('Foto carregada. Toque em Reconhecer ou cadastrar.', true);
+    setOut('Foto pronta. Toque em RECONHECER ou preencha o nome e CADASTRAR.', true);
   };
+  img.onerror = () => { setOut('Não foi possível ler a imagem.', false); URL.revokeObjectURL(url); };
   img.src = url;
   ev.target.value = '';
 };
@@ -330,32 +433,35 @@ function postImage(url, blob, extraForm) {
 document.getElementById('btnRec').onclick = () => {
   frameBlob(async (blob) => {
     if (!blob) return;
+    setOut('Analisando…', true);
     try {
       const r = await postImage('/api/recognize', blob);
       const j = await r.json();
-      if (!r.ok) { setOut(j.detail || 'Erro', false); return; }
-      if (!j.face_found) setOut('Nenhuma face detectada.', false);
-      else if (j.name) setOut('Reconhecido: ' + j.name + ' (' + (j.confidence * 100).toFixed(1) + '% confiança)', true);
+      if (!r.ok) { setOut(errText(j), false); return; }
+      if (j.message) setOut(j.message, !!j.name);
+      else if (!j.face_found) setOut('Nenhuma face detectada.', false);
+      else if (j.name) setOut('Reconhecido: ' + j.name + ' (~' + (j.confidence * 100).toFixed(0) + '%)', true);
       else setOut('Face detectada, mas não cadastrada.', false);
     } catch (e) {
-      setOut(String(e), false);
+      setOut('Falha de rede. No celular use o link http://IP:8000 (mesma Wi-Fi) e servidor com --host 0.0.0.0.', false);
     }
   });
 };
 
 function doCad(amostra) {
   const nome = document.getElementById('nome').value.trim();
-  if (!nome) { setOut('Preencha o nome.', false); return; }
+  if (!nome) { setOut('Digite o nome antes de cadastrar.', false); return; }
   frameBlob(async (blob) => {
     if (!blob) return;
+    setOut('Cadastrando…', true);
     try {
       const r = await postImage('/api/register', blob, { nome, amostra: amostra ? 'true' : 'false' });
       const j = await r.json();
-      if (!r.ok) { setOut(typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail), false); return; }
-      setOut(j.message || 'OK', true);
+      if (!r.ok) { setOut(errText(j), false); return; }
+      setOut(j.message || 'Cadastro OK', true);
       refreshStatus();
     } catch (e) {
-      setOut(String(e), false);
+      setOut('Falha de rede. Confira Wi-Fi, firewall e se o servidor usa --host 0.0.0.0.', false);
     }
   });
 }

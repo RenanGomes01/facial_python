@@ -740,7 +740,7 @@ class FaceRecognitionSystem:
     
     def init_database(self):
         """Inicializa banco de dados."""
-        self.conn = sqlite3.connect(self.db_file)
+        self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
         cursor = self.conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS recognitions (
