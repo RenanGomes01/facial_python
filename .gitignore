@@ -1,9 +1,32 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Ambientes virtuais
 .venv/
 venv/
+env/
+
+# Dados locais / sensíveis (não versionar)
 .env
 *.pkl
 *.db
 fotos_reais/
 exports/
+
+# IDEs e SO
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs e temporários
+*.log
+.coverage
+htmlcov/

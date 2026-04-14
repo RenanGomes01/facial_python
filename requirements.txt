@@ -1,8 +1,13 @@
+# Visão computacional e imagem
 opencv-python
 numpy
 Pillow
+
+# Reconhecimento facial (dlib + modelos)
 face-recognition
 dlib
+
+# Servidor web
 fastapi
 uvicorn[standard]
 python-multipart
