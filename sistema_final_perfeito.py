@@ -27,8 +27,11 @@ class FaceRecognitionSystem:
     COLOR_WHITE = (255, 255, 255)
     COLOR_BLACK = (0, 0, 0)
     
-    def __init__(self):
-        """Inicializa o sistema."""
+    def __init__(self, headless=False):
+        """Inicializa o sistema.
+        headless=True: sem câmera OpenCV (uso com servidor web / API).
+        """
+        self.headless = headless
         self.cap = None
         self.face_cascade = None
         self.known_face_features = []
@@ -706,15 +709,18 @@ class FaceRecognitionSystem:
         
         os.makedirs(self.fotos_reais_dir, exist_ok=True)
         
-        # Câmera
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            print("❌ Erro ao abrir câmera")
-            return
-        
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        # Câmera (apenas modo desktop)
+        if not self.headless:
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                print("❌ Erro ao abrir câmera")
+                return
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+        else:
+            self.cap = None
+            print("🌐 Modo headless (reconhecimento via rede / API)")
         
         # Detector de faces
         cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
@@ -1094,6 +1100,33 @@ class FaceRecognitionSystem:
         else:
             print("❌ Erro ao extrair características")
     
+    def cadastrar_web(self, frame_copy, face_rect_copy, nome, adicionar_amostra=False):
+        """Cadastro chamado pela API web (sem fluxo de teclado). Retorna (ok, mensagem)."""
+        nome = (nome or "").strip()
+        if not nome:
+            return False, "Nome não pode estar vazio"
+        if nome not in self.known_face_names and adicionar_amostra:
+            return False, f"Pessoa '{nome}' não está cadastrada"
+        if nome in self.known_face_names and not adicionar_amostra:
+            return False, f"'{nome}' já cadastrada; use amostra extra"
+        features = self.extract_face_encoding_face_recognition(
+            frame_copy, face_rect_copy, num_jitters=3
+        )
+        if features is None:
+            return False, "Não foi possível extrair características da face"
+        if adicionar_amostra:
+            if nome not in self.multiple_samples:
+                self.multiple_samples[nome] = []
+            self.multiple_samples[nome].append(features)
+        else:
+            self.known_face_features.append(features)
+            self.known_face_names.append(nome)
+            self.multiple_samples[nome] = []
+            self.stats["total_cadastros"] += 1
+        self.save_photo(nome, frame_copy, face_rect_copy)
+        self.save_face_encodings()
+        return True, "Cadastro concluído"
+    
     def cadastrar_pessoa(self, frame, face_rect):
         """Inicia modo de entrada de nome."""
         if self.input_mode:
@@ -1378,6 +1411,9 @@ class FaceRecognitionSystem:
     
     def run(self):
         """Loop principal."""
+        if self.headless or self.cap is None:
+            print("❌ Modo headless: use o servidor web (web_app) em vez de run()")
+            return
         print("🎥 Iniciando câmera...")
         
         while True:

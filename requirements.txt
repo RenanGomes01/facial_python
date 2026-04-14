@@ -3,3 +3,6 @@ numpy
 Pillow
 face-recognition
 dlib
+fastapi
+uvicorn[standard]
+python-multipart
